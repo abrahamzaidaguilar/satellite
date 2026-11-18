@@ -28,6 +28,8 @@ final class ManagementClient: ObservableObject {
     /// While the admin hasn't acknowledged this device yet, re-announce often (the admin may have started after
     /// the device). Stops once confirmed, when the slower inventory timer takes over.
     private var announceTimer: Timer?
+    /// The frequent liveness ping once confirmed (see `heartbeatInterval`).
+    private var heartbeatTimer: Timer?
     private var started = false
 
     private init() { state = ManagementState.load() }
@@ -102,27 +104,64 @@ final class ManagementClient: ObservableObject {
         let keys: Management.Keys
         do { keys = try Management.Keys(state.keys) } catch { status = .offline("keys unreadable"); return }
         self.keys = keys
-        let connection = SatellaConnection(host: host, identity: keys, channels: [channel(state)]) { [weak self] relay in
-            Task { @MainActor in self?.handle(relay.text) }
-        }
+        let connection = SatellaConnection(
+            host: host, identity: keys, channels: [channel(state)],
+            onRelay: { [weak self] relay in Task { @MainActor in self?.handle(relay.text) } },
+            // A connection that drops after it was up (sleep, network change, relay restart) must come back, or the
+            // device goes silent to the admin until Satellite is relaunched.
+            onClose: { [weak self] in Task { @MainActor in self?.connectionDropped() } })
         self.connection = connection
         do {
             try await connection.start()
             status = .online
+            reconnectDelay = 2
             await report()
             scheduleReports()
             scheduleAnnounce(state)
         } catch {
             status = .offline(error.localizedDescription)
             try? await Task.sleep(nanoseconds: 30 * 1_000_000_000)   // a managed laptop is often offline at launch
-            if self.connection === connection { await connect(state) }
+            if self.connection === connection, let current = self.state { await connect(current) }
         }
     }
+
+    /// Backoff for reconnecting after a drop: 2s, doubling, at most a minute.
+    private var reconnectDelay: Double = 2
+
+    private func connectionDropped() {
+        guard let dropped = connection, let state else { return }
+        status = .offline("connection lost; reconnecting")
+        heartbeatTimer?.invalidate()
+        let delay = reconnectDelay
+        reconnectDelay = min(reconnectDelay * 2, 60)
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard self.connection === dropped else { return }   // replaced or stopped meanwhile
+            await self.connect(state)
+        }
+    }
+
+    /// How often a confirmed device tells the admin it's alive. Small (no inventory), so it can be frequent.
+    static let heartbeatInterval: TimeInterval = 60
 
     private func scheduleReports() {
         inventoryTimer?.invalidate()
         inventoryTimer = Timer.scheduledTimer(withTimeInterval: 1800, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.report(kind: "inventory") }
+        }
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: Self.heartbeatInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.heartbeat() }
+        }
+    }
+
+    /// The lightweight liveness ping: just the policy version (so the admin can resend policy if we're behind).
+    /// Until the admin has confirmed us, the announce timer does this job instead.
+    private func heartbeat() async {
+        guard let state, state.confirmed, let keys, let connection else { return }
+        struct Beat: Encodable { var type = "heartbeat"; var id = Management.newID(); var ts = Management.now(); var policyVersion: Int }
+        if let sealed = try? Management.seal(keys, toSign: state.admin.sign, toKx: state.admin.kx, Beat(policyVersion: state.policy.version)) {
+            await connection.send(sealed, on: Management.adminInbox(state.admin.sign))
         }
     }
 
