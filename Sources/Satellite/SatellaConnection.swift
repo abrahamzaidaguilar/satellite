@@ -53,6 +53,10 @@ actor SatellaConnection {
     private var pending: CheckedContinuation<Reply?, Never>?
     private var requestChain: Task<Void, Never> = Task {}
     private var running = false
+    /// Set once `start()` has finished the handshake, cleared when the socket goes. Requests from outside wait for
+    /// it, so they never slip in between the handshake's steps (the relay refuses them before the key is proven).
+    private var ready = false
+    private static let readyTimeout: TimeInterval = 15
 
     var isRunning: Bool { running }
 
@@ -74,7 +78,7 @@ actor SatellaConnection {
     /// Listens on one more channel now (and again after any reconnect). No-op if already subscribed.
     func subscribe(_ channel: String) async throws {
         if !channels.contains(channel) { channels.append(channel) }
-        guard running, task != nil else { return }   // the next handshake will subscribe it
+        guard await isReadySoon(onlyIfConnecting: true) else { return }   // the next handshake will subscribe it
         let reply = try await request(.json, "/v1/relay/\(wireID(channel))/subscribe")
         guard reply?.status == 200 else { throw Management.ProtocolError("Couldn\u{2019}t subscribe to \(channel).") }
     }
@@ -99,7 +103,7 @@ actor SatellaConnection {
     /// Joins a room (`<group>.<room>`) now and after any reconnect, and returns its members' keys as the relay lists
     /// them. Throws when not connected or when the relay refuses.
     func join(_ room: String) async throws -> [String] {
-        guard running, task != nil else { throw Management.ProtocolError("Not connected.") }
+        try await waitUntilReady()
         let isNew = !rooms.contains(room)
         if isNew { rooms.append(room) }   // before the request, so pushes that beat the reply aren't dropped
         let reply = try? await request(.json, "/v1/room/\(wireID(room))/join")
@@ -114,7 +118,7 @@ actor SatellaConnection {
     func leave(_ room: String) async {
         let wasIn = rooms.contains(room)
         rooms.removeAll { $0 == room }
-        guard wasIn, running, task != nil else { return }
+        guard wasIn, ready else { return }
         _ = try? await request(.json, "/v1/room/\(wireID(room))/leave")
     }
 
@@ -135,7 +139,7 @@ actor SatellaConnection {
     /// Receives the relay's server notifications now and after any reconnect.
     func subscribeNotifications() async throws {
         wantsNotifications = true
-        guard running, task != nil else { return }   // the next handshake will subscribe
+        guard await isReadySoon(onlyIfConnecting: true) else { return }   // the next handshake will subscribe
         let reply = try await request(.json, "/v1/notifications/subscribe")
         guard reply?.status == 200 else { throw Management.ProtocolError("Couldn\u{2019}t subscribe to notifications.") }
     }
@@ -147,7 +151,7 @@ actor SatellaConnection {
 
     /// One request with a reply, for the store routes: a JSON frame when `body` is nil, else a RAW frame with it.
     func call(_ route: String, body: Data? = nil) async throws -> Response {
-        guard running, task != nil else { throw Management.ProtocolError("Not connected.") }
+        try await waitUntilReady()
         let reply = try await request(body == nil ? .json : .raw, route, body: body ?? Data())
         guard let reply else { throw Management.ProtocolError("The relay didn\u{2019}t answer.") }
         return Response(status: Int(reply.status), body: reply.data)
@@ -181,7 +185,11 @@ actor SatellaConnection {
         } else {
             throw Management.ProtocolError("The relay didn\u{2019}t send a challenge.")
         }
-        for channel in channels {
+        // By index over the live lists: a channel or room added while the handshake runs is covered too.
+        var index = 0
+        while index < channels.count {
+            let channel = channels[index]
+            index += 1
             let reply = try await request(.json, "/v1/relay/\(wireID(channel))/subscribe")
             guard reply?.status == 200 else { throw Management.ProtocolError("Couldn\u{2019}t subscribe to \(channel).") }
         }
@@ -190,15 +198,34 @@ actor SatellaConnection {
             guard reply?.status == 200 else { throw Management.ProtocolError("Couldn\u{2019}t subscribe to notifications.") }
         }
         // A new socket is in no rooms. Rejoin each, and report who is there now so the owner can reconcile.
-        for room in rooms {
+        index = 0
+        while index < rooms.count {
+            let room = rooms[index]
+            index += 1
             let reply = try await request(.json, "/v1/room/\(wireID(room))/join")
             guard reply?.status == 200 else { throw Management.ProtocolError("Couldn\u{2019}t rejoin \(room).") }
             onRoom(RoomEvent(kind: .members, room: room, sender: "", members: Self.members(reply?.data ?? Data())))
         }
+        ready = true
+    }
+
+    /// Waits for the handshake to finish (one under way, or a reconnect), up to `readyTimeout`.
+    private func waitUntilReady() async throws {
+        guard await isReadySoon() else { throw Management.ProtocolError("Can\u{2019}t reach the relay right now.") }
+    }
+
+    /// With `onlyIfConnecting`, waits only for a handshake already under way, not for a reconnect.
+    private func isReadySoon(onlyIfConnecting: Bool = false) async -> Bool {
+        let deadline = Date().addingTimeInterval(Self.readyTimeout)
+        while !ready, Date() < deadline, running || !onlyIfConnecting {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        return ready
     }
 
     func stop() {
         running = false
+        ready = false
         pending?.resume(returning: nil)
         pending = nil
         task?.cancel(with: .goingAway, reason: nil)
@@ -304,6 +331,7 @@ actor SatellaConnection {
     }
 
     private func deliverNil() {
+        ready = false
         pending?.resume(returning: nil)
         pending = nil
         if running {   // the socket dropped on its own (not stop()); let the owner reconnect

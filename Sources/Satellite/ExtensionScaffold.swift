@@ -456,7 +456,21 @@ enum ExtensionScaffold {
 
         Groups are 1–64 and rooms 1–48 characters of `[A-Za-z0-9._-]`, up to 64 members. Join before sending. Messages
         are text up to 64 KB, 60 a second per room. After a reconnect you get `onLeave` for every member, then `onJoin`
-        for whoever is still there.
+        for whoever is still there, and you're back in the room without calling `join` again.
+
+        **`join` can fail; retry it.** While the relay is down or still connecting, `join` (like the store methods)
+        waits up to 15 seconds, then rejects with "Can't reach the relay right now." It also rejects if the user chose
+        Don't Allow. Catch it, show that you're offline, and try again a few seconds later while your UI still wants
+        the room. Never leave a "connecting…" state up after a single failed attempt:
+
+        ```js
+        async function joinWithRetry(group, room, isWanted) {
+          while (isWanted()) {
+            try { return await satellite.relay.rooms.join(group, room); }
+            catch (error) { showOffline(error.message); await new Promise(r => setTimeout(r, 5000)); }
+          }
+        }
+        ```
 
         ### Stores: `satellite.relay.stores` (`relay-stores`)
 
@@ -477,7 +491,8 @@ enum ExtensionScaffold {
 
         Channels and keys are 1–128 characters of `[A-Za-z0-9._@-]`, with no leading, trailing or doubled dots. Values
         are text, 1 byte to 4 KB (store JSON as a string). **Store reads haven't been verified against the live relay
-        yet**: treat `get` as best effort and keep a local copy in `satellite.storage`.
+        yet**: treat `get` as best effort and keep a local copy in `satellite.storage`. Like `join`, every store call
+        rejects with "Can't reach the relay right now." if the relay stays unreachable for 15 seconds.
 
         ### Relay notifications: `satellite.relay.notifications` (`relay-notifications`)
 

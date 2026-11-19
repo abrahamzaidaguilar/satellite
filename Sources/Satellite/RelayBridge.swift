@@ -316,14 +316,18 @@ final class RelayManager {
                     ExtensionManager.shared.emit(id, type: "relayNotification", arguments: [Self.notificationFields(payload)])
                 }
             })
-        conns[id] = Conn(connection: connection)
+        // Marked as reconnecting while the first handshake runs, so other callers (other pages, a join) wait for it
+        // instead of taking it for dead and restarting the socket under it.
+        conns[id] = Conn(connection: connection, reconnecting: true)
         do {
             try await connection.start()
+            conns[id]?.reconnecting = false
             conns[id]?.connected = true
             conns[id]?.retry = 2.0
         } catch {
             // Don't leave a dead connection: keep retrying in the background so it heals on its own, then report
             // this first failure to the caller (the extension may also retry, which revives it via the branch above).
+            conns[id]?.reconnecting = false
             reconnect(id)
             throw error
         }
