@@ -51,7 +51,12 @@ actor SatellaConnection {
     private var task: URLSessionWebSocketTask?
     private var session: URLSession?
     private var pending: CheckedContinuation<Reply?, Never>?
-    private var requestChain: Task<Void, Never> = Task {}
+    /// One request at a time, held until its reply (or timeout): the relay answers in order, so a second request in
+    /// flight would take the first one's reply, and its continuation would overwrite `pending` and leak.
+    private var requestBusy = false
+    private var requestWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Numbers each request, so a timeout only ends the request it was started for.
+    private var requestNumber = 0
     private var running = false
     /// Set once `start()` has finished the handshake, cleared when the socket goes. Requests from outside wait for
     /// it, so they never slip in between the handshake's steps (the relay refuses them before the key is proven).
@@ -278,12 +283,11 @@ actor SatellaConnection {
     // MARK: Requests (answered in order)
 
     private func request(_ type: FrameType, _ route: String, body: Data = Data()) async throws -> Reply? {
-        // Chain requests so a late reply is never taken for the next request's.
-        let previous = requestChain
-        let task = Task { await previous.value }
-        requestChain = task
-        await task.value
+        await acquireRequest()
+        defer { releaseRequest() }
         guard let socket = self.task, running else { throw Management.ProtocolError("Not connected.") }
+        requestNumber += 1
+        let number = requestNumber
         // Register `pending` BEFORE sending: the relay can reply faster than the send call returns, and a reply
         // that arrives with no pending continuation would be dropped and the request would hang until timeout.
         return await withCheckedContinuation { (continuation: CheckedContinuation<Reply?, Never>) in
@@ -292,13 +296,22 @@ actor SatellaConnection {
             Task { try? await socket.send(.data(frame)) }
             Task { [weak self] in
                 try? await Task.sleep(nanoseconds: UInt64(Self.replyTimeout * 1_000_000_000))
-                await self?.timeout(route)
+                await self?.timeout(route, number)
             }
         }
     }
 
-    private func timeout(_ route: String) {
-        guard let pending else { return }
+    private func acquireRequest() async {
+        guard requestBusy else { requestBusy = true; return }
+        await withCheckedContinuation { requestWaiters.append($0) }   // handed the turn by releaseRequest()
+    }
+
+    private func releaseRequest() {
+        if requestWaiters.isEmpty { requestBusy = false } else { requestWaiters.removeFirst().resume() }
+    }
+
+    private func timeout(_ route: String, _ number: Int) {
+        guard number == requestNumber, let pending else { return }   // answered already; a later request is waiting
         self.pending = nil
         pending.resume(returning: nil)
         // A late reply would land on the next request, so drop the socket.
