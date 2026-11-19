@@ -210,6 +210,7 @@ final class ExtensionManager: ObservableObject {
             ExtensionStorage.shared.deleteAll(id)
             ExtensionSettings.shared.deleteAll(id)
             ShortcutRegistry.shared.forgetChoices(owner: id)
+            MainActor.assumeIsolated { RelayConsent.shared.forget(id) }
         }
         reload()
     }
@@ -426,7 +427,7 @@ final class ExtensionManager: ObservableObject {
           window.addEventListener('error', (event) => {
             if (String(event.filename).indexOf('\(id).js') >= 0) __send('error', (event.error && event.error.stack) || event.message);
           });
-          const __listeners = { settings: [], shortcut: [], relay: [] };
+          const __listeners = { settings: [], shortcut: [], relay: [], roomMessage: [], roomJoin: [], roomLeave: [], relayNotification: [] };
           const __shortcutHandlers = Object.create(null);
           __listeners.shortcut.push(id => { const handler = __shortcutHandlers[id]; if (handler) handler(); });
           window.__satelliteEmit = (type, args) => {
@@ -472,6 +473,32 @@ final class ExtensionManager: ObservableObject {
                 unsubscribe: channel => post('relay.unsubscribe', { channel: String(channel) }),
                 send: (channel, text) => post('relay.send', { channel: String(channel), text: String(text) }),
                 onMessage: callback => { if (typeof callback === 'function') __listeners.relay.push(callback); },
+                rooms: Object.freeze({
+                  join: (group, room) => post('relay.rooms.join', { group: String(group), room: String(room) }),
+                  leave: (group, room) => post('relay.rooms.leave', { group: String(group), room: String(room) }),
+                  send: (group, room, text, to) => post('relay.rooms.send', { group: String(group), room: String(room), text: String(text), to: to == null ? null : String(to) }),
+                  members: (group, room) => post('relay.rooms.members', { group: String(group), room: String(room) }),
+                  onMessage: callback => { if (typeof callback === 'function') __listeners.roomMessage.push(callback); },
+                  onJoin: callback => { if (typeof callback === 'function') __listeners.roomJoin.push(callback); },
+                  onLeave: callback => { if (typeof callback === 'function') __listeners.roomLeave.push(callback); },
+                }),
+                stores: Object.freeze({
+                  channel: Object.freeze({
+                    get: (channel, key) => post('relay.stores.channel.get', { channel: String(channel), key: String(key) }),
+                    set: (channel, key, value) => post('relay.stores.channel.set', { channel: String(channel), key: String(key), value: String(value) }),
+                    remove: (channel, key) => post('relay.stores.channel.remove', { channel: String(channel), key: String(key) }),
+                  }),
+                  player: Object.freeze({
+                    get: (channel, key, options) => post('relay.stores.player.get', { channel: String(channel), key: String(key), scope: String((options && options.scope) || 'private'), player: options && options.player != null ? String(options.player) : null }),
+                    set: (channel, key, value, options) => post('relay.stores.player.set', { channel: String(channel), key: String(key), value: String(value), scope: String((options && options.scope) || 'private') }),
+                    remove: (channel, key, options) => post('relay.stores.player.remove', { channel: String(channel), key: String(key), scope: String((options && options.scope) || 'private') }),
+                  }),
+                }),
+                notifications: Object.freeze({
+                  subscribe: () => post('relay.notifications.subscribe'),
+                  unsubscribe: () => post('relay.notifications.unsubscribe'),
+                  onNotification: callback => { if (typeof callback === 'function') __listeners.relayNotification.push(callback); },
+                }),
               }),
               ui: Object.freeze({ apps: list('apps'), assistants: list('assistants') }),
               shortcuts: Object.freeze({
@@ -595,8 +622,92 @@ final class ExtensionBridge: NSObject, WKScriptMessageHandlerWithReply {
             }
 
         case "relay.identity":
-            guard allowed(.relay) else { return }
+            // The public sender key only, never the private key. Any relay feature uses it (room members and store
+            // owners are identified by it), so any of their permissions is enough.
+            let relayPermissions: [ExtensionPermission] = [.relay, .relayRooms, .relayStores, .relayNotifications]
+            guard relayPermissions.contains(where: permissions.contains) else {
+                return replyHandler(nil, "Permission denied: add \u{201C}relay\u{201D} (or relay-rooms, relay-stores or relay-notifications) to \u{201C}permissions\u{201D} in manifest.json")
+            }
             Task { @MainActor in replyHandler(RelayManager.shared.identityHex(for: extensionID), nil) }
+
+        case "relay.rooms.join", "relay.rooms.leave", "relay.rooms.send", "relay.rooms.members":
+            guard allowed(.relayRooms) else { return }
+            guard let group = params["group"] as? String, let room = params["room"] as? String else {
+                return replyHandler(nil, "Missing room group or room")
+            }
+            let id = extensionID
+            Task { @MainActor in
+                let relay = RelayManager.shared
+                do {
+                    switch method {
+                    case "relay.rooms.join":
+                        let joined = try await relay.join(id, group: group, room: room)
+                        replyHandler(joined, nil)
+                    case "relay.rooms.leave":
+                        try await relay.leave(id, group: group, room: room)
+                        replyHandler(nil, nil)
+                    case "relay.rooms.send":
+                        guard let text = params["text"] as? String else { return replyHandler(nil, "Missing text") }
+                        try await relay.sendToRoom(id, group: group, room: room, text: text, to: params["to"] as? String)
+                        replyHandler(nil, nil)
+                    default:
+                        replyHandler(try relay.roomMembers(id, group: group, room: room), nil)
+                    }
+                } catch { replyHandler(nil, error.localizedDescription) }
+            }
+
+        case "relay.stores.channel.get", "relay.stores.channel.set", "relay.stores.channel.remove",
+             "relay.stores.player.get", "relay.stores.player.set", "relay.stores.player.remove":
+            guard allowed(.relayStores) else { return }
+            guard let channel = params["channel"] as? String, let key = params["key"] as? String else {
+                return replyHandler(nil, "Missing store channel or key")
+            }
+            let player = method.hasPrefix("relay.stores.player.")
+            let scopeName = params["scope"] as? String ?? "private"
+            guard let scope = RelayManager.StoreScope(rawValue: scopeName) else {
+                return replyHandler(nil, "A store scope is \u{201C}private\u{201D} or \u{201C}public\u{201D}")
+            }
+            let value = params["value"] as? String
+            if method.hasSuffix(".set"), value == nil { return replyHandler(nil, "Missing value") }
+            let id = extensionID
+            Task { @MainActor in
+                let relay = RelayManager.shared
+                do {
+                    switch (player, method.split(separator: ".").last ?? "") {
+                    case (false, "get"):
+                        let result = try await relay.channelStoreGet(id, channel: channel, key: key)
+                        replyHandler(result ?? NSNull(), nil)
+                    case (false, "set"):
+                        try await relay.channelStoreSet(id, channel: channel, key: key, value: value ?? "")
+                        replyHandler(nil, nil)
+                    case (false, _):
+                        try await relay.channelStoreRemove(id, channel: channel, key: key)
+                        replyHandler(nil, nil)
+                    case (true, "get"):
+                        let result = try await relay.playerStoreGet(id, channel: channel, scope: scope, key: key, player: params["player"] as? String)
+                        replyHandler(result ?? NSNull(), nil)
+                    case (true, "set"):
+                        try await relay.playerStoreSet(id, channel: channel, scope: scope, key: key, value: value ?? "")
+                        replyHandler(nil, nil)
+                    default:
+                        try await relay.playerStoreRemove(id, channel: channel, scope: scope, key: key)
+                        replyHandler(nil, nil)
+                    }
+                } catch { replyHandler(nil, error.localizedDescription) }
+            }
+
+        case "relay.notifications.subscribe":
+            guard allowed(.relayNotifications) else { return }
+            let id = extensionID
+            Task { @MainActor in
+                do { try await RelayManager.shared.subscribeNotifications(id); replyHandler(nil, nil) }
+                catch { replyHandler(nil, error.localizedDescription) }
+            }
+
+        case "relay.notifications.unsubscribe":
+            guard allowed(.relayNotifications) else { return }
+            let id = extensionID
+            Task { @MainActor in await RelayManager.shared.unsubscribeNotifications(id); replyHandler(nil, nil) }
 
         case "relay.subscribe":
             guard allowed(.relay) else { return }

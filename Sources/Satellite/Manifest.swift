@@ -43,6 +43,9 @@ enum ExtensionPermission: String, Codable, CaseIterable, Hashable {
     case shortcuts
     case salesforce
     case relay
+    case relayRooms = "relay-rooms"
+    case relayStores = "relay-stores"
+    case relayNotifications = "relay-notifications"
 
     var summary: String {
         switch self {
@@ -54,6 +57,9 @@ enum ExtensionPermission: String, Codable, CaseIterable, Hashable {
         case .shortcuts: return "Add keyboard shortcuts and menu commands"
         case .salesforce: return "Read Salesforce records you can see, signed in as you (your session stays in Satellite)"
         case .relay: return "Send and receive messages on Satellite\u{2019}s shared relay (a third-party online service)"
+        case .relayRooms: return "Join rooms on Satellite\u{2019}s shared relay and message their members (a third-party online service; asks you for each room group)"
+        case .relayStores: return "Save and read values in stores on Satellite\u{2019}s shared relay (a third-party online service; asks you for each store)"
+        case .relayNotifications: return "Receive notifications the shared relay sends (a third-party online service)"
         }
     }
 }
